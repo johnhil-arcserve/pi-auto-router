@@ -64,7 +64,7 @@ export class QuotaCache {
 
   constructor(opts: QuotaCacheOptions = {}) {
     this.ttlMs = opts.ttlMs ?? envTtlMs() ?? DEFAULT_TTL_MS;
-    this.thresholds = opts.thresholds ?? DEFAULT_UVI_THRESHOLDS;
+    this.thresholds = opts.thresholds ?? resolveUviThresholds();
     this.fetchConfig = opts.fetchConfig ?? {};
     this.enabled = opts.enabled ?? envEnabled();
   }
@@ -195,6 +195,67 @@ function envTtlMs(): number | undefined {
   if (!raw) return undefined;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+const UVI_THRESHOLD_KEYS = ["stressed", "critical", "surplus", "surplusMinElapsed"] as const;
+
+/**
+ * Resolve UVI pacing thresholds from env and settings, falling back to the
+ * built-in defaults per field. Precedence (matching enabled/ttl): env var >
+ * settings.json > default. Read once at QuotaCache construction, so a change
+ * takes effect on the next pi restart.
+ *
+ * Lower `critical`/`stressed` = more conservative pacing (block/demote a
+ * provider sooner as it gets ahead of even consumption of its window).
+ *   critical  -> UVI at/above which a provider is blocked   (default 2.0)
+ *   stressed  -> UVI at/above which a provider is demoted    (default 1.5)
+ *   surplus   -> UVI at/below which a provider is promoted    (default 0.5)
+ *   surplusMinElapsed -> min fraction of the window elapsed before a surplus
+ *                        promotion is allowed, clamped to 0..1 (default 0.7)
+ *
+ * settings.json shape:
+ *   { "autoRouterUviThresholds": { "critical": 1.2, "stressed": 1.0 } }
+ * env vars: AUTO_ROUTER_UVI_CRITICAL, AUTO_ROUTER_UVI_STRESSED,
+ *           AUTO_ROUTER_UVI_SURPLUS, AUTO_ROUTER_UVI_SURPLUS_MIN_ELAPSED
+ */
+export function resolveUviThresholdsFrom(
+  env: NodeJS.ProcessEnv,
+  settingsThresholds: Partial<UVIThresholds> | undefined,
+): UVIThresholds {
+  const fromEnv = (name: string): number | undefined => {
+    const raw = env[name];
+    if (raw === undefined || raw === "") return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  };
+  const st = settingsThresholds ?? {};
+  const stressed = fromEnv("AUTO_ROUTER_UVI_STRESSED") ?? st.stressed ?? DEFAULT_UVI_THRESHOLDS.stressed;
+  const critical = fromEnv("AUTO_ROUTER_UVI_CRITICAL") ?? st.critical ?? DEFAULT_UVI_THRESHOLDS.critical;
+  const surplus = fromEnv("AUTO_ROUTER_UVI_SURPLUS") ?? st.surplus ?? DEFAULT_UVI_THRESHOLDS.surplus;
+  const surplusMinElapsed =
+    fromEnv("AUTO_ROUTER_UVI_SURPLUS_MIN_ELAPSED") ?? st.surplusMinElapsed ?? DEFAULT_UVI_THRESHOLDS.surplusMinElapsed;
+  return { stressed, critical, surplus, surplusMinElapsed: Math.max(0, Math.min(1, surplusMinElapsed)) };
+}
+
+function readUviThresholdsFromSettings(): Partial<UVIThresholds> {
+  try {
+    const raw = fs.readFileSync(SETTINGS_PATH, "utf-8");
+    const settings = JSON.parse(raw);
+    const t = settings.autoRouterUviThresholds;
+    if (!t || typeof t !== "object") return {};
+    const out: Partial<UVIThresholds> = {};
+    for (const key of UVI_THRESHOLD_KEYS) {
+      const v = (t as Record<string, unknown>)[key];
+      if (typeof v === "number" && Number.isFinite(v) && v > 0) out[key] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function resolveUviThresholds(): UVIThresholds {
+  return resolveUviThresholdsFrom(process.env, readUviThresholdsFromSettings());
 }
 
 function readUviEnabledFromSettings(): boolean {

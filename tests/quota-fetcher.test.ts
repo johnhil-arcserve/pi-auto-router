@@ -341,6 +341,69 @@ describe("fetchClaudeUsage", () => {
     assert.match(usage.error ?? "", /HTTP 429/);
     assert.equal(usage.sessionResetsInSec, 120);
   });
+
+  it("captures the monthly usage-credit pool when consumer windows are null (Team/Enterprise)", async () => {
+    // Real response shape observed on a usage-credit account: every consumer
+    // rolling window is null; the only budget signal is extra_usage / spend.
+    const fetchFn = mockFetch({
+      "/api/oauth/usage": mockResponse({
+        five_hour: null,
+        seven_day: null,
+        seven_day_opus: null,
+        extra_usage: { is_enabled: true, monthly_limit: 25000, used_credits: 18497, utilization: 73.988, spend_limit_reached: false },
+        spend: { percent: 74, severity: "normal", enabled: true },
+      }),
+    });
+    const usage = await fetchClaudeUsage("token", { fetchFn });
+    assert.equal(usage.session, 0);
+    assert.equal(usage.weekly, 0);
+    assert.equal(usage.extraSpend, 18497);
+    assert.equal(usage.extraLimit, 25000);
+    assert.ok(usage.extraPercent !== undefined && Math.abs(usage.extraPercent - 73.988) < 1e-6);
+    assert.equal(usage.extraHardStop, false);
+  });
+
+  it("flags a hard stop when the monthly credit pool is exhausted", async () => {
+    const fetchFn = mockFetch({
+      "/api/oauth/usage": mockResponse({
+        five_hour: null,
+        seven_day: null,
+        extra_usage: { is_enabled: true, monthly_limit: 25000, used_credits: 25000, utilization: 100, spend_limit_reached: true },
+        spend: { percent: 100, severity: "critical", enabled: true },
+      }),
+    });
+    const usage = await fetchClaudeUsage("token", { fetchFn });
+    assert.equal(usage.extraHardStop, true);
+  });
+});
+
+describe("usageToWindows anthropic monthly credit pool", () => {
+  it("emits a monthly window from extra usage when five_hour/seven_day are null", () => {
+    const windows = usageToWindows("anthropic", {
+      session: 0,
+      weekly: 0,
+      extraSpend: 18497,
+      extraLimit: 25000,
+      extraPercent: 73.988,
+      fetchedAt: Date.now(),
+    });
+    const monthly = windows.find((w) => w.scope === "monthly");
+    assert.ok(monthly, "expected a monthly window");
+    assert.ok(Math.abs(monthly!.usedPercent - 73.988) < 1e-6);
+    assert.ok(monthly!.windowDurationMs > 0);
+    assert.ok(typeof monthly!.resetsAt === "string" && monthly!.resetsAt.length > 0);
+    assert.equal(monthly!.source, "oauth-usage");
+  });
+
+  it("omits the monthly window for Pro/Max accounts with no extra usage", () => {
+    const windows = usageToWindows("anthropic", {
+      session: 40,
+      weekly: 18,
+      fetchedAt: Date.now(),
+    });
+    assert.equal(windows.find((w) => w.scope === "monthly"), undefined);
+    assert.equal(windows.filter((w) => w.scope === "session" || w.scope === "weekly").length, 2);
+  });
 });
 
 describe("fetchGoogleUsage", () => {

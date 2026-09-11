@@ -169,7 +169,12 @@ export class QuotaCache {
         continue;
       }
       const windows = usageToWindows(id, usage);
-      const snap = aggregateProviderUVI(id, windows, now, this.thresholds);
+      let snap = aggregateProviderUVI(id, windows, now, this.thresholds);
+      // Hard backstop: a monthly usage-credit pool that is fully spent must block
+      // regardless of pace (UVI alone can read "ok" for an early, fast burn).
+      if (usage.extraHardStop) {
+        snap = { ...snap, status: "critical", reason: `monthly spend limit reached; ${snap.reason}` };
+      }
       this.snapshots.set(id, snap);
     }
     this.lastRefreshAt = now;

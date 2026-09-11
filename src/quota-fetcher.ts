@@ -6,7 +6,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import type { QuotaWindow } from "./types.ts";
+import type { QuotaSource, QuotaWindow } from "./types.ts";
 
 export type OAuthProviderId =
   | "openai-codex"
@@ -32,6 +32,10 @@ export interface UsageData {
   weeklyResetsInSec?: number;
   extraSpend?: number;
   extraLimit?: number;
+  /** Percent (0..100) of the monthly usage-credit pool consumed. */
+  extraPercent?: number;
+  /** True when the monthly usage-credit pool is exhausted (hard stop). */
+  extraHardStop?: boolean;
   warning?: string;
   stale?: boolean;
   fetchedAt?: number;
@@ -294,6 +298,54 @@ export function readPercentCandidate(value: unknown): number | null {
   return null;
 }
 
+/**
+ * Percent (0..100) of the monthly usage-credit pool consumed.
+ *
+ * Prefers the exact spend/limit ratio when both are present; otherwise falls
+ * back to the server-reported `utilization` field. Some accounts (Team /
+ * Enterprise usage credits) expose this pool INSTEAD of the consumer
+ * five_hour / seven_day rolling windows, which come back null there.
+ */
+export function readExtraUsagePercent(
+  extra: { utilization?: unknown } | null | undefined,
+  spend?: number,
+  limit?: number,
+): number | undefined {
+  if (typeof spend === "number" && Number.isFinite(spend) && typeof limit === "number" && Number.isFinite(limit) && limit > 0) {
+    return Math.max(0, Math.min(100, (spend / limit) * 100));
+  }
+  return readPercentCandidate(extra?.utilization) ?? undefined;
+}
+
+/**
+ * Build a calendar-month QuotaWindow from an already-computed usedPercent.
+ *
+ * Unlike balance-fetcher's buildMonthlyQuotaWindow (source "config", derived
+ * from a locally-tracked spend against a configured budget), this carries the
+ * real server-side percent and is tagged with the caller's source (normally
+ * "oauth-usage"), so UVI paces against Anthropic's own monthly credit pool.
+ */
+export function buildMonthlyUsageWindow(
+  provider: string,
+  usedPercent: number,
+  source: QuotaSource,
+  fetchedAt: number,
+  now = Date.now(),
+): QuotaWindow {
+  const d = new Date(now);
+  const startOfMonth = new Date(d.getFullYear(), d.getMonth(), 1).getTime();
+  const endOfMonth = new Date(d.getFullYear(), d.getMonth() + 1, 1).getTime();
+  return {
+    provider,
+    scope: "monthly",
+    usedPercent: Math.max(0, Math.min(100, usedPercent)),
+    resetsAt: new Date(endOfMonth).toISOString(),
+    windowDurationMs: endOfMonth - startOfMonth,
+    source,
+    fetchedAt,
+  };
+}
+
 function usedPercentFromRemainingFraction(value: unknown): number | null {
   if (typeof value !== "number" || !Number.isFinite(value)) return null;
   const remaining = Math.max(0, Math.min(1, value));
@@ -428,6 +480,13 @@ export async function fetchClaudeUsage(token: string, config: RequestConfig = {}
   if (data?.extra_usage?.is_enabled) {
     usage.extraSpend = typeof data.extra_usage.used_credits === "number" ? data.extra_usage.used_credits : undefined;
     usage.extraLimit = typeof data.extra_usage.monthly_limit === "number" ? data.extra_usage.monthly_limit : undefined;
+    usage.extraPercent = readExtraUsagePercent(data.extra_usage, usage.extraSpend, usage.extraLimit);
+    // Hard stop: the monthly credit pool is exhausted. This must block regardless
+    // of pacing (a fast-but-early burn can look fine to UVI while already capped).
+    usage.extraHardStop =
+      data.extra_usage.spend_limit_reached === true ||
+      (typeof data?.spend?.percent === "number" && data.spend.percent >= 100) ||
+      (typeof usage.extraPercent === "number" && usage.extraPercent >= 100);
   }
   return usage;
 }
@@ -564,6 +623,14 @@ export function usageToWindows(provider: OAuthProviderId, usage: UsageData | nul
         source,
         fetchedAt,
       });
+      // Monthly usage-credit pool. On Team/Enterprise accounts the five_hour /
+      // seven_day windows above come back null (usedPercent 0), and this pool is
+      // the only real budget signal. It is account-wide and server-side, so it
+      // paces consistently across every machine. Emitted only when present, so
+      // Pro/Max accounts (no extra_usage) are unaffected.
+      if (typeof usage.extraPercent === "number") {
+        windows.push(buildMonthlyUsageWindow(provider, usage.extraPercent, source, fetchedAt));
+      }
       break;
     }
     case "google-gemini-cli":

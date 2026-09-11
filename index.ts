@@ -995,12 +995,41 @@ function lookupModelCost(target: RouteTarget, context: Context): { inputUsd: num
   return { inputUsd: cost.input, outputUsd: cost.output };
 }
 
-/** Estimate cost for a target given estimated input tokens and a rough output multiplier (default 4×). */
+/** Estimate list-price cost for a target given estimated input tokens and a rough output multiplier (default 4×). */
 function estimateModelCost(target: RouteTarget, context: Context, estimatedInputTokens: number): number | null {
   const cost = lookupModelCost(target, context);
   if (!cost) return null;
   const estimatedOutputTokens = estimatedInputTokens * 4;
   return (estimatedInputTokens * cost.inputUsd + estimatedOutputTokens * cost.outputUsd) / 1_000_000;
+}
+
+/**
+ * Estimate the MARGINAL cost of a target for ranking.
+ *
+ * A subscription/flat-rate seat (GitHub Copilot business seat, local vLLM) costs
+ * nothing extra per token, so its per-token list price is NOT its marginal cost and
+ * must not be used to rank it against another provider — doing so would push traffic
+ * toward whichever seat happens to have the cheapest *list* price and drain a real
+ * budget faster. Such targets rank at 0.
+ *
+ * A UVI-PACED provider is also returned as 0 here ON PURPOSE. Its real budget
+ * pressure already enters the pipeline through UVI buckets (promoted/normal/demoted),
+ * so also ranking it by list price inside a bucket would double-count cost and, worse,
+ * invert tier intent — e.g. Anthropic (Enterprise, genuinely per-token, metered
+ * against the monthly credit pool) would be demoted below a $0 Copilot seat on every
+ * latency tie, defeating an L1-Anthropic quality-first ladder. We let UVI do the cost
+ * work and keep the within-bucket cost tiebreak neutral for it. Only a genuinely
+ * metered provider with NO UVI window carries its real list-price estimate.
+ */
+function estimateMarginalCost(
+  target: RouteTarget,
+  context: Context,
+  estimatedInputTokens: number,
+  isUviPaced?: (provider: string) => boolean,
+): number | null {
+  if (getTargetBilling(target) === "subscription") return 0;
+  if (isUviPaced?.(target.provider)) return 0;
+  return estimateModelCost(target, context, estimatedInputTokens);
 }
 
 function extractUsageMetrics(usage: unknown): { inputTokens?: number; outputTokens?: number; costUsd?: number } {
@@ -1236,7 +1265,9 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
       // Sort within UVI buckets: latency → cost → config order.
       // Build a config-order index so we can break ties by priority (L1 before L8).
       const configIndex = new Map(ctx.availableTargets.map((t, i) => [getTargetKey(t), i]));
-      const getCost = (target: RouteTarget) => estimateModelCost(target, context, ctx.estimatedTokens);
+      const uviPacedProviders = new Set(Object.keys(budgetState?.utilization ?? {}));
+      const getCost = (target: RouteTarget) =>
+        estimateMarginalCost(target, context, ctx.estimatedTokens, (p) => uviPacedProviders.has(p));
       const getConfigIndex = (target: RouteTarget) => configIndex.get(getTargetKey(target)) ?? 999;
       const rankedSort = (a: RouteTarget, b: RouteTarget): number => compareTargets(a, b, {
         getLatency: (target) => latencyTracker.getAvgLatency(target.provider),

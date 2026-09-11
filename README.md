@@ -78,7 +78,7 @@ pi install git:github.com/danialranjha/pi-auto-router
 - **Policy rules** — force tiers, prefer/exclude providers, enforce billing/constraints, per-route scoping, dry-run traces
 - **Per-provider budget tracking** with daily/monthly limits, persistent stats, and audit-driven failover
 - **Utilization Velocity Index (UVI)** — real-time OAuth quota monitoring that adjusts routing priority on the fly
-- **Cost-aware ranking** — estimated USD cost as secondary tiebreaker within latency-sorted UVI buckets
+- **Cost-aware ranking** — estimated **marginal** USD cost as secondary tiebreaker within latency-sorted UVI buckets (subscription seats and UVI-paced providers rank neutral; only genuinely metered non-UVI providers carry list price — see [Cost as a secondary tiebreaker](#cost-as-a-secondary-tiebreaker-marginal-not-list-price))
 - **Routing decision explainer** so you can see why a target was selected
 - **Richer operator commands** for status, route inspection, search, aliases, reloads, budgets, UVI, rules, circuit status, and explanations
 
@@ -531,6 +531,16 @@ The router tracks per-provider request latency (time-to-response) using a rollin
 3. Demoted (UVI stressed), sorted fastest → slowest
 
 Providers with no latency history sort last within their bucket (cold start). Data persists in `~/.pi/agent/extensions/auto-router.latency.json` and survives restarts.
+
+### Cost as a secondary tiebreaker (marginal, not list price)
+
+After latency, targets are ranked by **marginal** cost — the real incremental dollar cost of one more request — *not* the model's per-token list price. This distinction matters:
+
+- **Subscription / flat-rate seats** (e.g. a GitHub Copilot business seat, a local vLLM/Ollama model) cost nothing extra per token, so they rank at **0**. Ranking them by list price would push traffic toward whichever seat is nominally cheapest and needlessly drain a metered budget elsewhere.
+- **UVI-paced providers** also rank at **0** on cost, on purpose. Their real budget pressure already enters the pipeline through UVI buckets (promoted/normal/demoted), so also ranking them by list price would double-count cost and can invert tier intent — e.g. an Anthropic Enterprise account (genuinely per-token, metered against a monthly credit pool but paced by UVI) would otherwise be demoted below a $0 subscription seat on every latency tie, defeating a quality-first L1-Anthropic ladder. Let UVI do the cost work; keep the within-bucket cost tiebreak neutral.
+- **Genuinely metered providers with no UVI window** (e.g. a Google/DeepSeek API key with a monthly budget but no live quota window) carry their real list-price estimate, so cost meaningfully orders them.
+
+Tag a target's cost model explicitly with `"billing": "subscription"` or `"billing": "per-token"` in the route config; when omitted it is auto-detected (`per-token` if the provider has a monthly budget set, else `subscription`). The decision log and `/auto-router explain` still display the model's list-price estimate (`est cost $X`) for reference, independent of how it was ranked.
 
 View latency data in `/auto-router list` (shows per-target ⏱ avg) and `/auto-router explain` (includes avg latency in reasoning). Reset with `/auto-router reset`.
 

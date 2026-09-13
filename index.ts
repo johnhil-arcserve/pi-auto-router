@@ -16,7 +16,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { buildRoutingContext } from "./src/context-analyzer.ts";
 import { DEFAULT_SHORTCUTS, listShortcuts, parseShortcut } from "./src/shortcut-parser.ts";
 import { inferRequirements, solveConstraints, tierToRequirements, type CapabilityMap, type ConstraintRequirements } from "./src/constraint-solver.ts";
-import { BudgetTracker, monthKey, todayKey } from "./src/budget-tracker.ts";
+import { BudgetTracker, cacheHitRate, monthKey, todayKey, totalPromptTokens } from "./src/budget-tracker.ts";
 import { partitionAuditedCandidates } from "./src/candidate-partitioner.ts";
 import { QuotaCache, mapRouteProviderToOAuth } from "./src/quota-cache.ts";
 import { getProviderHealthCache } from "./src/health-check.ts";
@@ -1032,13 +1032,18 @@ function estimateMarginalCost(
   return estimateModelCost(target, context, estimatedInputTokens);
 }
 
-function extractUsageMetrics(usage: unknown): { inputTokens?: number; outputTokens?: number; costUsd?: number } {
+function extractUsageMetrics(usage: unknown): { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; costUsd?: number } {
   const raw = usage && typeof usage === "object" ? usage as Record<string, unknown> : {};
   const cost = raw.cost && typeof raw.cost === "object" ? raw.cost as Record<string, unknown> : {};
   const inputTokens = typeof raw.input === "number" ? raw.input : undefined;
   const outputTokens = typeof raw.output === "number" ? raw.output : undefined;
+  // Prompt caching splits the prompt across three counters. Reading only `input`
+  // captures the uncached remainder and silently drops the cached bulk, which is
+  // why a 64K-context call was logging as ~2 input tokens.
+  const cacheReadTokens = typeof raw.cacheRead === "number" ? raw.cacheRead : undefined;
+  const cacheWriteTokens = typeof raw.cacheWrite === "number" ? raw.cacheWrite : undefined;
   const costUsd = typeof cost.total === "number" ? cost.total : undefined;
-  return { inputTokens, outputTokens, costUsd };
+  return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, costUsd };
 }
 
 function parseRatingInput(input: string): { rating?: "good" | "bad"; reason?: string; tags: string[] } {
@@ -1159,6 +1164,8 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
     let finalActualTarget: RouteTarget | null = null;
     let finalInputTokens: number | undefined;
     let finalOutputTokens: number | undefined;
+    let finalCacheReadTokens: number | undefined;
+    let finalCacheWriteTokens: number | undefined;
     let finalCostUsd: number | undefined;
     const attempts: DecisionAttemptLog[] = [];
     try {
@@ -1544,6 +1551,8 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
           finalActualTarget = target;
           finalInputTokens = usageMetrics.inputTokens;
           finalOutputTokens = usageMetrics.outputTokens;
+          finalCacheReadTokens = usageMetrics.cacheReadTokens;
+          finalCacheWriteTokens = usageMetrics.cacheWriteTokens;
           finalCostUsd = usageMetrics.costUsd;
           attempts.push({
             index: attemptIndex + 1,
@@ -1555,6 +1564,8 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
             ttftMs: result.ttftMs,
             inputTokens: usageMetrics.inputTokens,
             outputTokens: usageMetrics.outputTokens,
+            cacheReadTokens: usageMetrics.cacheReadTokens,
+            cacheWriteTokens: usageMetrics.cacheWriteTokens,
             costUsd: usageMetrics.costUsd,
           });
           latencyTracker.recordLatency(target.provider, elapsed);
@@ -1598,6 +1609,8 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
             estimatedTokens: decision.metadata.estimatedTokens,
             inputTokens: finalInputTokens,
             outputTokens: finalOutputTokens,
+            cacheReadTokens: finalCacheReadTokens,
+            cacheWriteTokens: finalCacheWriteTokens,
             costUsd: finalCostUsd,
             budgetRemaining: decision.metadata.budgetRemaining,
             confidence: decision.metadata.confidence,
@@ -1616,6 +1629,8 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
             ttftMs: result.ttftMs,
             inputTokens: finalInputTokens,
             outputTokens: finalOutputTokens,
+            cacheReadTokens: finalCacheReadTokens,
+            cacheWriteTokens: finalCacheWriteTokens,
             costUsd: finalCostUsd,
           });
           emitRouterEvent("routing.final", { requestId, conversationId, routeId }, {
@@ -1734,6 +1749,8 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
             estimatedTokens: decision.metadata.estimatedTokens,
             inputTokens: finalInputTokens,
             outputTokens: finalOutputTokens,
+            cacheReadTokens: finalCacheReadTokens,
+            cacheWriteTokens: finalCacheWriteTokens,
             costUsd: finalCostUsd,
             budgetRemaining: decision.metadata.budgetRemaining,
             confidence: decision.metadata.confidence,
@@ -1752,6 +1769,8 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
             ttftMs: result.ttftMs,
             inputTokens: finalInputTokens,
             outputTokens: finalOutputTokens,
+            cacheReadTokens: finalCacheReadTokens,
+            cacheWriteTokens: finalCacheWriteTokens,
             costUsd: finalCostUsd,
             error: result.terminalError.errorMessage,
           });
@@ -1821,6 +1840,8 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
         estimatedTokens: decision.metadata.estimatedTokens,
         inputTokens: finalInputTokens,
         outputTokens: finalOutputTokens,
+        cacheReadTokens: finalCacheReadTokens,
+        cacheWriteTokens: finalCacheWriteTokens,
         costUsd: finalCostUsd,
         budgetRemaining: decision.metadata.budgetRemaining,
         confidence: decision.metadata.confidence,
@@ -1900,6 +1921,8 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
           estimatedTokens: decision.metadata.estimatedTokens,
           inputTokens: finalInputTokens,
           outputTokens: finalOutputTokens,
+          cacheReadTokens: finalCacheReadTokens,
+          cacheWriteTokens: finalCacheWriteTokens,
           costUsd: finalCostUsd,
           budgetRemaining: decision.metadata.budgetRemaining,
           confidence: decision.metadata.confidence,
@@ -2489,7 +2512,12 @@ export default function (pi: ExtensionAPI) {
             seen.add(s.provider);
             const limitText = typeof s.limitUsd === "number" ? `limit $${s.limitUsd.toFixed(2)}` : "no limit";
             const ratio = typeof s.limitUsd === "number" && s.limitUsd > 0 ? ` (${Math.round((s.estimatedCost / s.limitUsd) * 100)}%)` : "";
-            lines.push(`  ${s.provider.padEnd(22)} spend $${s.estimatedCost.toFixed(2)} | in ${s.inputTokens} | out ${s.outputTokens} | ${limitText}${ratio}`);
+            // Report the full prompt size (uncached + cache reads + cache writes),
+            // not just the uncached remainder, plus how much of it came from cache.
+            const promptTokens = totalPromptTokens(s);
+            const hit = cacheHitRate(s);
+            const cacheText = hit === null ? "" : ` | cache ${Math.round(hit * 100)}%`;
+            lines.push(`  ${s.provider.padEnd(22)} spend $${s.estimatedCost.toFixed(2)} | prompt ${promptTokens.toLocaleString()} | out ${s.outputTokens.toLocaleString()}${cacheText} | ${limitText}${ratio}`);
           }
           // Add monthly providers
           const monthlyLimits = budgetTracker.getMonthlyLimits();

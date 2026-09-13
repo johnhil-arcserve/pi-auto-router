@@ -8,14 +8,45 @@ export const DEFAULT_STATS_PATH = getAutoRouterStoragePaths({ ensure: false }).s
 export type ProviderDailyStats = {
   inputTokens: number;
   outputTokens: number;
+  /**
+   * Cached prompt tokens READ back on this call. With prompt caching active,
+   * providers report the cached prefix here and leave `inputTokens` holding only
+   * the uncached remainder -- so `inputTokens` alone understates the real context
+   * size by orders of magnitude. Billed at a discount, but never free.
+   */
+  cacheReadTokens: number;
+  /** Prompt tokens WRITTEN into the cache (billed at a premium over plain input). */
+  cacheWriteTokens: number;
   estimatedCost: number;
 };
 
 export type ProviderMonthlyStats = {
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   estimatedCost: number;
 };
+
+/** Zero-value stats row; also the shape older (pre-cache-field) files migrate to. */
+export const EMPTY_PROVIDER_STATS: ProviderDailyStats = {
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+  estimatedCost: 0,
+};
+
+/** Total prompt tokens actually sent: uncached remainder + cache reads + cache writes. */
+export function totalPromptTokens(stats: { inputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }): number {
+  return stats.inputTokens + (stats.cacheReadTokens ?? 0) + (stats.cacheWriteTokens ?? 0);
+}
+
+/** Share of prompt tokens served from cache (0-1), or null when nothing was sent. */
+export function cacheHitRate(stats: { inputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }): number | null {
+  const total = totalPromptTokens(stats);
+  return total > 0 ? (stats.cacheReadTokens ?? 0) / total : null;
+}
 
 export type ProviderLimit = {
   dailyUsd?: number;
@@ -67,6 +98,9 @@ function sanitizeStatsFile(input: unknown): BudgetStatsFile {
       base.daily[day][provider] = {
         inputTokens: sanitizeNumber(rawStats.inputTokens),
         outputTokens: sanitizeNumber(rawStats.outputTokens),
+        // Absent in files written before cache accounting landed -> 0.
+        cacheReadTokens: sanitizeNumber(rawStats.cacheReadTokens),
+        cacheWriteTokens: sanitizeNumber(rawStats.cacheWriteTokens),
         estimatedCost: sanitizeNumber(rawStats.estimatedCost),
       };
     }
@@ -81,6 +115,8 @@ function sanitizeStatsFile(input: unknown): BudgetStatsFile {
       base.monthly[mon][provider] = {
         inputTokens: sanitizeNumber(rawStats.inputTokens),
         outputTokens: sanitizeNumber(rawStats.outputTokens),
+        cacheReadTokens: sanitizeNumber(rawStats.cacheReadTokens),
+        cacheWriteTokens: sanitizeNumber(rawStats.cacheWriteTokens),
         estimatedCost: sanitizeNumber(rawStats.estimatedCost),
       };
     }
@@ -153,7 +189,7 @@ export class BudgetTracker {
 
   getDailyProviderStats(provider: string, day = todayKey()): ProviderDailyStats {
     const dayStats = this.stats.daily[day]?.[provider];
-    return dayStats ?? { inputTokens: 0, outputTokens: 0, estimatedCost: 0 };
+    return dayStats ?? { ...EMPTY_PROVIDER_STATS };
   }
 
   getDailySpend(day = todayKey()): Record<string, number> {
@@ -189,7 +225,7 @@ export class BudgetTracker {
     return state;
   }
 
-  getDailySummary(day = todayKey()): Array<{ provider: string; inputTokens: number; outputTokens: number; estimatedCost: number; limitUsd?: number }> {
+  getDailySummary(day = todayKey()): Array<{ provider: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; estimatedCost: number; limitUsd?: number }> {
     const providers = new Set<string>([
       ...Object.keys(this.stats.daily[day] ?? {}),
       ...Object.keys(this.stats.limits),
@@ -209,12 +245,18 @@ export class BudgetTracker {
     const cost = raw.cost && typeof raw.cost === "object" ? raw.cost as Record<string, unknown> : {};
     const inputTokens = sanitizeNumber(raw.input);
     const outputTokens = sanitizeNumber(raw.output);
+    // cacheRead/cacheWrite are where the bulk of a cached prompt lands; recording
+    // only `input` made a 64K-context call look like a 2-token call.
+    const cacheReadTokens = sanitizeNumber(raw.cacheRead);
+    const cacheWriteTokens = sanitizeNumber(raw.cacheWrite);
     const estimatedCost = sanitizeNumber(cost.total);
     const dayStats = this.ensureDay(day);
-    const current = dayStats[provider] ?? { inputTokens: 0, outputTokens: 0, estimatedCost: 0 };
+    const current = dayStats[provider] ?? { ...EMPTY_PROVIDER_STATS };
     dayStats[provider] = {
       inputTokens: current.inputTokens + inputTokens,
       outputTokens: current.outputTokens + outputTokens,
+      cacheReadTokens: current.cacheReadTokens + cacheReadTokens,
+      cacheWriteTokens: current.cacheWriteTokens + cacheWriteTokens,
       estimatedCost: current.estimatedCost + estimatedCost,
     };
     await this.save();
@@ -265,12 +307,16 @@ export class BudgetTracker {
     const cost = raw.cost && typeof raw.cost === "object" ? raw.cost as Record<string, unknown> : {};
     const inputTokens = sanitizeNumber(raw.input);
     const outputTokens = sanitizeNumber(raw.output);
+    const cacheReadTokens = sanitizeNumber(raw.cacheRead);
+    const cacheWriteTokens = sanitizeNumber(raw.cacheWrite);
     const estimatedCost = sanitizeNumber(cost.total);
     const monStats = this.ensureMonth(mon);
-    const current = monStats[provider] ?? { inputTokens: 0, outputTokens: 0, estimatedCost: 0 };
+    const current = monStats[provider] ?? { ...EMPTY_PROVIDER_STATS };
     monStats[provider] = {
       inputTokens: current.inputTokens + inputTokens,
       outputTokens: current.outputTokens + outputTokens,
+      cacheReadTokens: current.cacheReadTokens + cacheReadTokens,
+      cacheWriteTokens: current.cacheWriteTokens + cacheWriteTokens,
       estimatedCost: current.estimatedCost + estimatedCost,
     };
     await this.save();
@@ -278,6 +324,6 @@ export class BudgetTracker {
 
   getMonthlyProviderStats(provider: string, mon = monthKey()): ProviderMonthlyStats {
     const monStats = this.stats.monthly[mon]?.[provider];
-    return monStats ?? { inputTokens: 0, outputTokens: 0, estimatedCost: 0 };
+    return monStats ?? { ...EMPTY_PROVIDER_STATS };
   }
 }

@@ -105,6 +105,8 @@ export type DecisionAttemptLog = {
   ttftMs?: number;
   inputTokens?: number;
   outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
   costUsd?: number;
   error?: string;
 };
@@ -313,10 +315,15 @@ export type DecisionLogEntry = {
   buildOutcome?: ValidationOutcome;
   /** Estimated token count for this request */
   estimatedTokens: number;
-  /** Actual input tokens reported by provider, if available */
+  /** Actual input tokens reported by provider, if available. With prompt caching
+   *  this is only the UNCACHED remainder -- see cacheReadTokens. */
   inputTokens?: number;
   /** Actual output tokens reported by provider, if available */
   outputTokens?: number;
+  /** Cached prompt tokens read back on this call, if reported. */
+  cacheReadTokens?: number;
+  /** Prompt tokens written into the cache on this call, if reported. */
+  cacheWriteTokens?: number;
   /** Actual cost reported by provider, if available */
   costUsd?: number;
   /** Budget remaining for the selected billing scope (USD) */

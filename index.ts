@@ -26,7 +26,7 @@ import { orderCandidateBuckets, parseRoutingOrder, type RoutingOrder } from "./s
 import { CacheOptimizerRouting, applyCacheOptimizerHints } from "./src/cache-optimizer-routing.ts";
 import { getVirtualThinkingLevelMap } from "./src/virtual-model.ts";
 import { getAutoRouterStoragePaths } from "./src/storage-paths.ts";
-import { BUDGET_STATUS_KEY, advanceBudgetDay, formatBudgetStatus, loadBudgetDayState, localDayKey, saveBudgetDayState, type BudgetDayState } from "./src/budget-status.ts";
+import { BUDGET_STATUS_KEY, advanceBudgetDay, formatBudgetStatus, formatBudgetUnavailable, loadBudgetDayState, localDayKey, persistedToday, recordReading, saveBudgetDayState, type BudgetDayState } from "./src/budget-status.ts";
 import { classifyIntent, intentToTier, type IntentResult } from "./src/intent-classifier.ts";
 import { FeedbackTracker } from "./src/feedback-tracker.ts";
 import { buildRatingFromCompletedDecision, getMostRecentCompletedDecision, rememberCompletedDecision, type CompletedDecisionFeedbackContext } from "./src/rating-attribution.ts";
@@ -424,10 +424,16 @@ function loadRoutesConfig(): void {
   routesCache = DEFAULT_ROUTES;
   aliasesCache = DEFAULT_ALIASES;
   configError = undefined;
-  syncQuotaProviderFilter();
+  // Do NOT sync the quota provider filter here. setProviderFilter() DELETES
+  // snapshots for providers it doesn't see, and DEFAULT_ROUTES has no
+  // anthropic target, so syncing against the defaults before the routes file
+  // is read wiped the Anthropic UVI snapshot on every UI update (session
+  // start, model select, agent start/end). Sync once the final routes are
+  // known, in each branch below.
 
   if (!existsSync(ROUTES_PATH)) {
     configureStorage(undefined);
+    syncQuotaProviderFilter();
     return;
   }
 
@@ -2054,7 +2060,6 @@ const BUDGET_PROVIDERS: Array<{ id: "anthropic"; label: string }> = [{ id: "anth
 let budgetDayState: BudgetDayState | undefined;
 let budgetDayStateLoadedFrom: string | undefined;
 const budgetFoldedFetchAt = new Map<string, number>();
-const budgetLastText = new Map<string, { todayCents: number; todayExact: boolean }>();
 
 function budgetDayStatePath(): string {
   return join(storagePaths.directory, "auto-router.budget-day.json");
@@ -2071,28 +2076,48 @@ function refreshBudgetStatus(ctx: any): void {
     const parts: string[] = [];
     let worst: "ok" | "stressed" | "critical" = "ok";
     let dirty = false;
+    const today = localDayKey(new Date());
     for (const { id, label } of BUDGET_PROVIDERS) {
       const usage = quotaCache.getUsage(id);
-      if (!usage || typeof usage.extraSpend !== "number" || typeof usage.extraLimit !== "number") continue;
-      // Fold each successful reading into the day state exactly once.
-      const fetchedAt = usage.fetchedAt ?? 0;
-      if (!usage.stale && budgetFoldedFetchAt.get(id) !== fetchedAt) {
-        const r = advanceBudgetDay(budgetDayState, id, usage.extraSpend, localDayKey(new Date()));
-        budgetDayState = r.state;
-        budgetFoldedFetchAt.set(id, fetchedAt);
-        budgetLastText.set(id, { todayCents: r.todayUsed, todayExact: r.exact });
-        dirty = true;
+      const snapshot = quotaCache.getSnapshot(id);
+      const hasLive = !!usage && typeof usage.extraSpend === "number" && typeof usage.extraLimit === "number";
+      if (hasLive) {
+        // Fold each successful reading into the day state exactly once.
+        const fetchedAt = usage!.fetchedAt ?? 0;
+        if (!usage!.stale && budgetFoldedFetchAt.get(id) !== fetchedAt) {
+          const r = advanceBudgetDay(budgetDayState, id, usage!.extraSpend!, today);
+          budgetDayState = recordReading(r.state, id, usage!.extraSpend!, usage!.extraLimit!, fetchedAt || Date.now());
+          budgetFoldedFetchAt.set(id, fetchedAt);
+          dirty = true;
+        }
+        const t = persistedToday(budgetDayState, id, today);
+        parts.push(formatBudgetStatus({
+          label,
+          usedCents: usage!.extraSpend!,
+          limitCents: usage!.extraLimit!,
+          todayCents: t?.todayUsed,
+          todayExact: t?.exact ?? false,
+          stale: usage!.stale,
+        }));
+      } else if (budgetDayState?.reading?.[id]) {
+        // No fresh reading this process (e.g. usage endpoint 429ing since
+        // restart): show the last known one, marked stale.
+        const saved = budgetDayState.reading[id];
+        const t = persistedToday(budgetDayState, id, today);
+        parts.push(formatBudgetStatus({
+          label,
+          usedCents: saved.used,
+          limitCents: saved.limit,
+          todayCents: t?.todayUsed,
+          todayExact: t?.exact ?? false,
+          stale: true,
+        }));
+      } else if (snapshot?.error || quotaCache.isEnabled()) {
+        parts.push(formatBudgetUnavailable(label, snapshot?.error ?? (snapshot ? undefined : "waiting")));
+      } else {
+        continue;
       }
-      const today = budgetLastText.get(id) ?? { todayCents: 0, todayExact: false };
-      parts.push(formatBudgetStatus({
-        label,
-        usedCents: usage.extraSpend,
-        limitCents: usage.extraLimit,
-        todayCents: today.todayCents,
-        todayExact: today.todayExact,
-        stale: usage.stale,
-      }));
-      const status = quotaCache.getSnapshot(id)?.status;
+      const status = snapshot?.status;
       if (status === "critical") worst = "critical";
       else if (status === "stressed" && worst === "ok") worst = "stressed";
     }

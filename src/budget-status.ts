@@ -38,6 +38,12 @@ export type BudgetDayState = {
   dayStart: Record<string, DayStart>;
   /** Most recent reading per provider, carried across days to seed the next baseline. */
   last: Record<string, { used: number; day: string }>;
+  /**
+   * Last successful reading with its limit, so a restart during a run of
+   * failed fetches (the usage endpoint 429s readily) shows the last known
+   * figure marked stale instead of nothing.
+   */
+  reading?: Record<string, { used: number; limit: number; at: number }>;
 };
 
 export function emptyBudgetDayState(day: string): BudgetDayState {
@@ -75,6 +81,7 @@ export function advanceBudgetDay(
     day: base.day,
     dayStart: { ...base.dayStart },
     last: { ...base.last },
+    ...(base.reading ? { reading: { ...base.reading } } : {}),
   };
   if (next.day !== today) {
     next.day = today;
@@ -98,6 +105,33 @@ export function advanceBudgetDay(
   next.dayStart[provider] = start;
   next.last[provider] = { used, day: today };
   return { state: next, todayUsed: Math.max(0, used - start.used), exact: start.exact };
+}
+
+/** Record a successful reading (with its limit) for display after restarts. Pure. */
+export function recordReading(
+  state: BudgetDayState,
+  provider: string,
+  used: number,
+  limit: number,
+  at: number,
+): BudgetDayState {
+  return { ...state, reading: { ...(state.reading ?? {}), [provider]: { used, limit, at } } };
+}
+
+/**
+ * Today's spend from persisted state alone, for when no fresh reading exists.
+ * Undefined when the state does not describe today.
+ */
+export function persistedToday(
+  state: BudgetDayState | undefined,
+  provider: string,
+  today: string,
+): { todayUsed: number; exact: boolean } | undefined {
+  if (!state || state.day !== today) return undefined;
+  const start = state.dayStart[provider];
+  const last = state.last[provider];
+  if (!start || !last || last.day !== today) return undefined;
+  return { todayUsed: Math.max(0, last.used - start.used), exact: start.exact };
 }
 
 export function loadBudgetDayState(path: string): BudgetDayState | undefined {
@@ -127,18 +161,26 @@ function dollars(cents: number): string {
 
 /**
  * e.g. "claude $6.10d · $185/$250m 74%". A "~" prefix on the daily figure
- * marks a lower bound (baseline taken mid-day); "?" marks a stale reading.
+ * marks a lower bound (baseline taken mid-day); "$?d" means today is unknown;
+ * a trailing "?" marks a stale reading.
  */
 export function formatBudgetStatus(input: {
   label: string;
   usedCents: number;
   limitCents: number;
-  todayCents: number;
+  todayCents: number | undefined;
   todayExact: boolean;
   stale?: boolean;
 }): string {
   const pct = input.limitCents > 0 ? Math.round((input.usedCents / input.limitCents) * 100) : undefined;
-  const today = `${input.todayExact ? "" : "~"}${dollars(input.todayCents)}d`;
+  const today = input.todayCents === undefined
+    ? "$?d"
+    : `${input.todayExact ? "" : "~"}${dollars(input.todayCents)}d`;
   const month = `${dollars(input.usedCents)}/${dollars(input.limitCents)}m${pct !== undefined ? ` ${pct}%` : ""}`;
   return `${input.label} ${today} · ${month}${input.stale ? " ?" : ""}`;
+}
+
+/** Shown when there has never been a successful reading. Never silent. */
+export function formatBudgetUnavailable(label: string, error: string | undefined): string {
+  return `${label} budget ?${error ? ` (${error})` : ""}`;
 }

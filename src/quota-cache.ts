@@ -54,12 +54,20 @@ export type QuotaCacheOptions = {
 
 const DEFAULT_TTL_MS = 60_000;
 const MIN_REFRESH_INTERVAL_MS = 30_000;
+/**
+ * Cap for failure backoff. The Anthropic usage endpoint answers 429 with
+ * `retry-after: 0` and stays limited while polled every TTL, so retrying on
+ * the plain TTL can keep it limited indefinitely, leaving UVI and the footer
+ * blind. Each consecutive failed refresh doubles the wait, up to this cap.
+ */
+const MAX_FAILURE_BACKOFF_MS = 15 * 60_000;
 
 export class QuotaCache {
   private snapshots = new Map<OAuthProviderId, UtilizationSnapshot>();
   /** Last SUCCESSFUL raw usage per provider (for display); `stale` set when a later fetch failed. */
   private usages = new Map<OAuthProviderId, UsageData>();
   private lastRefreshAt = 0;
+  private consecutiveFailures = 0;
   private inflight: Promise<void> | null = null;
   private ttlMs: number;
   private thresholds: UVIThresholds;
@@ -115,7 +123,14 @@ export class QuotaCache {
 
   isStale(now = Date.now()): boolean {
     if (this.lastRefreshAt === 0) return true;
-    return now - this.lastRefreshAt > this.ttlMs;
+    return now - this.lastRefreshAt > this.effectiveTtlMs();
+  }
+
+  /** TTL, doubled per consecutive failed refresh (capped). */
+  effectiveTtlMs(): number {
+    if (this.consecutiveFailures === 0) return this.ttlMs;
+    const backoff = this.ttlMs * 2 ** Math.min(this.consecutiveFailures, 10);
+    return Math.max(this.ttlMs, Math.min(backoff, MAX_FAILURE_BACKOFF_MS));
   }
 
   /**
@@ -167,8 +182,11 @@ export class QuotaCache {
         this.markUsageStale(id);
       }
       this.lastRefreshAt = now;
+      this.consecutiveFailures++;
       return;
     }
+
+    let anyError = false;
 
     for (const id of providerIds) {
       const usage = usages[id];
@@ -191,6 +209,7 @@ export class QuotaCache {
           fetchedAt: now,
         });
         this.markUsageStale(id);
+        anyError = true;
         continue;
       }
       this.usages.set(id, { ...usage, stale: undefined, fetchedAt: usage.fetchedAt ?? now });
@@ -204,6 +223,7 @@ export class QuotaCache {
       this.snapshots.set(id, snap);
     }
     this.lastRefreshAt = now;
+    this.consecutiveFailures = anyError ? this.consecutiveFailures + 1 : 0;
   }
 }
 

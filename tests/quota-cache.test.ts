@@ -40,6 +40,14 @@ describe("resolveUviThresholdsFrom", () => {
     assert.deepEqual(resolveUviThresholdsFrom({}, undefined), DEFAULT_UVI_THRESHOLDS);
   });
 
+  it("resolves minElapsed env > settings > default, clamped to the 0.05 floor", () => {
+    assert.equal(resolveUviThresholdsFrom({}, undefined).minElapsed, 0.05);
+    assert.equal(resolveUviThresholdsFrom({}, { minElapsed: 0.1 }).minElapsed, 0.1);
+    assert.equal(resolveUviThresholdsFrom({ AUTO_ROUTER_UVI_MIN_ELAPSED: "0.2" }, { minElapsed: 0.1 }).minElapsed, 0.2);
+    assert.equal(resolveUviThresholdsFrom({}, { minElapsed: 0.01 }).minElapsed, 0.05);
+    assert.equal(resolveUviThresholdsFrom({}, { minElapsed: 5 }).minElapsed, 1);
+  });
+
   it("applies settings values over defaults", () => {
     const t = resolveUviThresholdsFrom({}, { critical: 1.2, stressed: 1.0 });
     assert.equal(t.critical, 1.2);

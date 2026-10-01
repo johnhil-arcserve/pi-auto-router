@@ -11,6 +11,7 @@ import {
 import { aggregateProviderUVI } from "./uvi.ts";
 import {
   DEFAULT_UVI_THRESHOLDS,
+  MIN_ELAPSED_FLOOR,
   type UVIThresholds,
   type UtilizationSnapshot,
 } from "./types.ts";
@@ -197,7 +198,7 @@ function envTtlMs(): number | undefined {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
-const UVI_THRESHOLD_KEYS = ["stressed", "critical", "surplus", "surplusMinElapsed"] as const;
+const UVI_THRESHOLD_KEYS = ["stressed", "critical", "surplus", "surplusMinElapsed", "minElapsed"] as const;
 
 /**
  * Resolve UVI pacing thresholds from env and settings, falling back to the
@@ -212,11 +213,16 @@ const UVI_THRESHOLD_KEYS = ["stressed", "critical", "surplus", "surplusMinElapse
  *   surplus   -> UVI at/below which a provider is promoted    (default 0.5)
  *   surplusMinElapsed -> min fraction of the window elapsed before a surplus
  *                        promotion is allowed, clamped to 0..1 (default 0.7)
+ *   minElapsed -> floor on the elapsed fraction in UVI's denominator, so
+ *                 early-window spend does not read as runaway pacing;
+ *                 clamped to 0.05..1 (default 0.05). 0.1 on a monthly pool
+ *                 treats day 1 as day 3.
  *
  * settings.json shape:
  *   { "autoRouterUviThresholds": { "critical": 1.2, "stressed": 1.0 } }
  * env vars: AUTO_ROUTER_UVI_CRITICAL, AUTO_ROUTER_UVI_STRESSED,
- *           AUTO_ROUTER_UVI_SURPLUS, AUTO_ROUTER_UVI_SURPLUS_MIN_ELAPSED
+ *           AUTO_ROUTER_UVI_SURPLUS, AUTO_ROUTER_UVI_SURPLUS_MIN_ELAPSED,
+ *           AUTO_ROUTER_UVI_MIN_ELAPSED
  */
 export function resolveUviThresholdsFrom(
   env: NodeJS.ProcessEnv,
@@ -234,7 +240,15 @@ export function resolveUviThresholdsFrom(
   const surplus = fromEnv("AUTO_ROUTER_UVI_SURPLUS") ?? st.surplus ?? DEFAULT_UVI_THRESHOLDS.surplus;
   const surplusMinElapsed =
     fromEnv("AUTO_ROUTER_UVI_SURPLUS_MIN_ELAPSED") ?? st.surplusMinElapsed ?? DEFAULT_UVI_THRESHOLDS.surplusMinElapsed;
-  return { stressed, critical, surplus, surplusMinElapsed: Math.max(0, Math.min(1, surplusMinElapsed)) };
+  const minElapsed =
+    fromEnv("AUTO_ROUTER_UVI_MIN_ELAPSED") ?? st.minElapsed ?? DEFAULT_UVI_THRESHOLDS.minElapsed ?? MIN_ELAPSED_FLOOR;
+  return {
+    stressed,
+    critical,
+    surplus,
+    surplusMinElapsed: Math.max(0, Math.min(1, surplusMinElapsed)),
+    minElapsed: Math.max(MIN_ELAPSED_FLOOR, Math.min(1, minElapsed)),
+  };
 }
 
 function readUviThresholdsFromSettings(): Partial<UVIThresholds> {

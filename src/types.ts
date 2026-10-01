@@ -70,13 +70,24 @@ export type UVIThresholds = {
   critical: number;
   surplus: number;
   surplusMinElapsed: number;
+  /**
+   * Floor on the elapsed fraction used as UVI's denominator. Early in a window
+   * a tiny elapsed fraction turns modest spend into a huge UVI; the floor
+   * treats the window as at least this far along. Optional so hand-built
+   * threshold objects keep working; absent means MIN_ELAPSED_FLOOR (0.05).
+   */
+  minElapsed?: number;
 };
+
+/** Historical hardcoded floor on UVI's elapsed-fraction denominator. */
+export const MIN_ELAPSED_FLOOR = 0.05;
 
 export const DEFAULT_UVI_THRESHOLDS: UVIThresholds = {
   stressed: 1.5,
   critical: 2.0,
   surplus: 0.5,
   surplusMinElapsed: 0.7,
+  minElapsed: MIN_ELAPSED_FLOOR,
 };
 
 export type DecisionCandidateTrace = {

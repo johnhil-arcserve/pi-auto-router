@@ -1,12 +1,11 @@
 import {
   DEFAULT_UVI_THRESHOLDS,
+  MIN_ELAPSED_FLOOR,
   type QuotaWindow,
   type UVIStatus,
   type UVIThresholds,
   type UtilizationSnapshot,
 } from "./types.ts";
-
-const EPSILON = 0.05;
 
 export function computeElapsedFraction(window: QuotaWindow, now: number): number {
   const duration = window.windowDurationMs;
@@ -26,10 +25,13 @@ export function computeElapsedFraction(window: QuotaWindow, now: number): number
   return Math.max(0, Math.min(1, 1 - clampedRemaining / duration));
 }
 
-export function computeUVI(window: QuotaWindow, now: number): number {
+export function computeUVI(window: QuotaWindow, now: number, minElapsed: number = MIN_ELAPSED_FLOOR): number {
   const consumed = Math.max(0, Math.min(1, window.usedPercent / 100));
   const elapsed = computeElapsedFraction(window, now);
-  const denom = Math.max(elapsed, EPSILON);
+  // Never let a configured floor drop below the historical one: a denominator
+  // near zero makes UVI explode on the first request of a window.
+  const floor = Number.isFinite(minElapsed) ? Math.max(MIN_ELAPSED_FLOOR, Math.min(1, minElapsed)) : MIN_ELAPSED_FLOOR;
+  const denom = Math.max(elapsed, floor);
   const uvi = consumed / denom;
   return Number.isFinite(uvi) ? uvi : 0;
 }
@@ -72,7 +74,7 @@ export function aggregateProviderUVI(
   let worstElapsed = 0;
   for (const w of windows) {
     const elapsed = computeElapsedFraction(w, now);
-    const uvi = computeUVI(w, now);
+    const uvi = computeUVI(w, now, thresholds.minElapsed ?? MIN_ELAPSED_FLOOR);
     if (uvi > worstUvi) {
       worstUvi = uvi;
       worstWindow = w;

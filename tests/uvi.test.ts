@@ -118,6 +118,46 @@ describe("classifyUVI", () => {
   });
 });
 
+describe("minElapsed floor", () => {
+  const now = 1_700_000_000_000;
+  // Monthly pool, 1 day into a 30-day window, 6% consumed.
+  const early = makeWindow({
+    scope: "monthly",
+    usedPercent: 6,
+    windowDurationMs: 30 * DAY,
+    resetsAt: new Date(now + 29 * DAY).toISOString(),
+  });
+
+  it("defaults to the historical 0.05 floor", () => {
+    // elapsed 1/30 < 0.05, so denom = 0.05 -> 0.06 / 0.05 = 1.2
+    assert.ok(Math.abs(computeUVI(early, now) - 1.2) < 1e-9);
+  });
+
+  it("a higher floor damps early-window UVI", () => {
+    assert.ok(Math.abs(computeUVI(early, now, 0.1) - 0.6) < 1e-9);
+  });
+
+  it("cannot be configured below the historical floor", () => {
+    assert.ok(Math.abs(computeUVI(early, now, 0.001) - 1.2) < 1e-9);
+  });
+
+  it("does not affect UVI once elapsed passes the floor", () => {
+    const mid = makeWindow({
+      scope: "monthly",
+      usedPercent: 50,
+      windowDurationMs: 30 * DAY,
+      resetsAt: new Date(now + 15 * DAY).toISOString(),
+    });
+    assert.equal(computeUVI(mid, now, 0.1), computeUVI(mid, now));
+  });
+
+  it("aggregateProviderUVI honours thresholds.minElapsed", () => {
+    const t = { stressed: 1.1, critical: 1.25, surplus: 0.5, surplusMinElapsed: 0.7 };
+    assert.equal(aggregateProviderUVI("anthropic", [early], now, t).status, "stressed");
+    assert.equal(aggregateProviderUVI("anthropic", [early], now, { ...t, minElapsed: 0.1 }).status, "ok");
+  });
+});
+
 describe("aggregateProviderUVI", () => {
   it("returns ok with empty windows", () => {
     const snap = aggregateProviderUVI("anthropic", [], 1_700_000_000_000);

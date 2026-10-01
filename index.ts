@@ -1988,6 +1988,41 @@ function getStatusLine(routeId?: string): string {
   return `auto-router ${getRouteName(routeId)}${tierHint}${shadowText}${hardText} | ${active}${contextText} | healthy: ${healthy.join(", ") || "none"} | ${formatCooldowns(routeId)}${budgetText}${healthIssuesText}${circuitText}${uviText}`;
 }
 
+/**
+ * Footer variant of getStatusLine(). The footer's status row is shared with
+ * every extension and truncated at terminal width, and pi's own stats row
+ * already shows the routed model (`swe-default → claude-sonnet-5`) and the
+ * context window. So this shows only what is NOT shown elsewhere: the tier,
+ * mode flags, and ALERTS, which are empty when everything is fine.
+ * `/auto-router status` keeps the verbose getStatusLine().
+ */
+function getCompactStatusLine(routeId?: string): string {
+  if (!routeId || !(routeId in routesCache)) return "router idle";
+  const now = Date.now();
+  const healthyTargets = getHealthyTargets(routeId);
+  const healthyKeys = new Set(healthyTargets.map((t) => getTargetKey(t, routeId)));
+  const out = routesCache[routeId].targets
+    .filter((t) => t && !healthyKeys.has(getTargetKey(t, routeId)))
+    .map((t) => {
+      const cd = cooldowns.get(getTargetKey(t, routeId));
+      const why = cd && cd.until > now ? ` ${formatRemainingMs(cd.until - now)}` : "";
+      return `${String(t.label ?? describeTarget(t))}${why}`;
+    });
+  const decision = lastDecisionByRoute.get(routeId);
+  const parts: string[] = [decision ? `router ${decision.tier}` : "router"];
+  if (shadowMode) parts.push("🔬 shadow");
+  if (uviHardMode && quotaCache.isEnabled()) parts.push("🛡️ uvi-hard");
+  if (healthyTargets.length === 0) parts.push("⚠ no healthy targets");
+  else if (out.length > 0) parts.push(`⚠ out: ${out.join(", ")}`);
+  const budgetWarning = lastBudgetWarningByRoute.get(routeId);
+  if (budgetWarning) parts.push(`⚠ ${budgetWarning}`);
+  // These helpers already return "" when healthy and lead with " | ".
+  const alerts = `${formatHealthIssuesSegment(healthyTargets)}${formatCircuitStatusSegment()}${formatUviStatusSegment()}`
+    .split(" | ").map((s) => s.trim()).filter(Boolean);
+  parts.push(...alerts);
+  return parts.join(" · ");
+}
+
 function formatUviStatusSegment(): string {
   const snaps: Record<string, UtilizationSnapshot> = {};
 
@@ -2042,7 +2077,7 @@ function refreshStatus(routeId?: string) {
   try {
     const activeModel = ctx.model;
     if (activeModel?.provider === PROVIDER_ID) {
-      ctx.ui.setStatus("auto-router", getStatusLine(routeId ?? activeModel.id));
+      ctx.ui.setStatus("auto-router", getCompactStatusLine(routeId ?? activeModel.id));
     } else {
       ctx.ui.setStatus("auto-router", undefined);
     }

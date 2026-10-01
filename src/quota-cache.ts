@@ -7,6 +7,7 @@ import {
   type FetchAllUsagesConfig,
   type OAuthProviderId,
   type UsageByProvider,
+  type UsageData,
 } from "./quota-fetcher.ts";
 import { aggregateProviderUVI } from "./uvi.ts";
 import {
@@ -56,6 +57,8 @@ const MIN_REFRESH_INTERVAL_MS = 30_000;
 
 export class QuotaCache {
   private snapshots = new Map<OAuthProviderId, UtilizationSnapshot>();
+  /** Last SUCCESSFUL raw usage per provider (for display); `stale` set when a later fetch failed. */
+  private usages = new Map<OAuthProviderId, UsageData>();
   private lastRefreshAt = 0;
   private inflight: Promise<void> | null = null;
   private ttlMs: number;
@@ -85,8 +88,21 @@ export class QuotaCache {
     this.fetchConfig = { ...this.fetchConfig, providerIds: next };
     const allowed = new Set(next);
     for (const id of OAUTH_PROVIDERS) {
-      if (!allowed.has(id)) this.snapshots.delete(id);
+      if (!allowed.has(id)) {
+        this.snapshots.delete(id);
+        this.usages.delete(id);
+      }
     }
+  }
+
+  /** Raw usage from the last successful fetch (e.g. monthly credit spend), if any. */
+  getUsage(oauthProvider: OAuthProviderId): UsageData | undefined {
+    return this.usages.get(oauthProvider);
+  }
+
+  private markUsageStale(id: OAuthProviderId): void {
+    const prev = this.usages.get(id);
+    if (prev) this.usages.set(id, { ...prev, stale: true });
   }
 
   getSnapshot(oauthProvider: OAuthProviderId): UtilizationSnapshot | undefined {
@@ -102,13 +118,18 @@ export class QuotaCache {
     return now - this.lastRefreshAt > this.ttlMs;
   }
 
-  /** Trigger a background refresh if stale. Never throws, never blocks the caller. */
-  refreshIfStale(now = Date.now()): void {
-    if (!this.enabled) return;
-    if (this.inflight) return;
-    if (now - this.lastRefreshAt < MIN_REFRESH_INTERVAL_MS) return;
-    if (!this.isStale(now)) return;
+  /**
+   * Trigger a background refresh if stale. Never throws, never blocks the caller.
+   * Returns the in-flight refresh (new or already running) so a caller MAY await
+   * it, or undefined when nothing is pending.
+   */
+  refreshIfStale(now = Date.now()): Promise<void> | undefined {
+    if (!this.enabled) return undefined;
+    if (this.inflight) return this.inflight;
+    if (now - this.lastRefreshAt < MIN_REFRESH_INTERVAL_MS) return undefined;
+    if (!this.isStale(now)) return undefined;
     this.inflight = this.refresh().finally(() => { this.inflight = null; });
+    return this.inflight;
   }
 
   /** Force a refresh now and wait for it. */
@@ -143,6 +164,7 @@ export class QuotaCache {
           stale: prev ? true : undefined,
           fetchedAt: now,
         });
+        this.markUsageStale(id);
       }
       this.lastRefreshAt = now;
       return;
@@ -153,6 +175,7 @@ export class QuotaCache {
       if (!usage) {
         // No auth or skipped; clear so we don't show stale data.
         this.snapshots.delete(id);
+        this.usages.delete(id);
         continue;
       }
       if (usage.error) {
@@ -167,8 +190,10 @@ export class QuotaCache {
           stale: prev ? true : undefined,
           fetchedAt: now,
         });
+        this.markUsageStale(id);
         continue;
       }
+      this.usages.set(id, { ...usage, stale: undefined, fetchedAt: usage.fetchedAt ?? now });
       const windows = usageToWindows(id, usage);
       let snap = aggregateProviderUVI(id, windows, now, this.thresholds);
       // Hard backstop: a monthly usage-credit pool that is fully spent must block

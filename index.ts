@@ -26,6 +26,7 @@ import { orderCandidateBuckets, parseRoutingOrder, type RoutingOrder } from "./s
 import { CacheOptimizerRouting, applyCacheOptimizerHints } from "./src/cache-optimizer-routing.ts";
 import { getVirtualThinkingLevelMap } from "./src/virtual-model.ts";
 import { getAutoRouterStoragePaths } from "./src/storage-paths.ts";
+import { BUDGET_STATUS_KEY, advanceBudgetDay, formatBudgetStatus, loadBudgetDayState, localDayKey, saveBudgetDayState, type BudgetDayState } from "./src/budget-status.ts";
 import { classifyIntent, intentToTier, type IntentResult } from "./src/intent-classifier.ts";
 import { FeedbackTracker } from "./src/feedback-tracker.ts";
 import { buildRatingFromCompletedDecision, getMostRecentCompletedDecision, rememberCompletedDecision, type CompletedDecisionFeedbackContext } from "./src/rating-attribution.ts";
@@ -2031,6 +2032,7 @@ function formatCircuitStatusSegment(): string {
 function refreshStatus(routeId?: string) {
   const ctx = latestUiContext;
   if (!ctx) return;
+  refreshBudgetStatus(ctx);
   try {
     const activeModel = ctx.model;
     if (activeModel?.provider === PROVIDER_ID) {
@@ -2041,6 +2043,77 @@ function refreshStatus(routeId?: string) {
   } catch {
     // Ignore stale context errors in non-interactive mode or during teardown
   }
+}
+
+// ---------------------------------------------------------------------------
+// Footer budget status (src/budget-status.ts). Account-level spend, shown under
+// its own key regardless of which model is active: Claude spend still counts
+// when you're on a direct model. Reuses the QuotaCache's fetch; never polls.
+// ---------------------------------------------------------------------------
+const BUDGET_PROVIDERS: Array<{ id: "anthropic"; label: string }> = [{ id: "anthropic", label: "claude" }];
+let budgetDayState: BudgetDayState | undefined;
+let budgetDayStateLoadedFrom: string | undefined;
+const budgetFoldedFetchAt = new Map<string, number>();
+const budgetLastText = new Map<string, { todayCents: number; todayExact: boolean }>();
+
+function budgetDayStatePath(): string {
+  return join(storagePaths.directory, "auto-router.budget-day.json");
+}
+
+function refreshBudgetStatus(ctx: any): void {
+  try {
+    const path = budgetDayStatePath();
+    if (budgetDayStateLoadedFrom !== path) {
+      budgetDayState = loadBudgetDayState(path);
+      budgetDayStateLoadedFrom = path;
+      budgetFoldedFetchAt.clear();
+    }
+    const parts: string[] = [];
+    let worst: "ok" | "stressed" | "critical" = "ok";
+    let dirty = false;
+    for (const { id, label } of BUDGET_PROVIDERS) {
+      const usage = quotaCache.getUsage(id);
+      if (!usage || typeof usage.extraSpend !== "number" || typeof usage.extraLimit !== "number") continue;
+      // Fold each successful reading into the day state exactly once.
+      const fetchedAt = usage.fetchedAt ?? 0;
+      if (!usage.stale && budgetFoldedFetchAt.get(id) !== fetchedAt) {
+        const r = advanceBudgetDay(budgetDayState, id, usage.extraSpend, localDayKey(new Date()));
+        budgetDayState = r.state;
+        budgetFoldedFetchAt.set(id, fetchedAt);
+        budgetLastText.set(id, { todayCents: r.todayUsed, todayExact: r.exact });
+        dirty = true;
+      }
+      const today = budgetLastText.get(id) ?? { todayCents: 0, todayExact: false };
+      parts.push(formatBudgetStatus({
+        label,
+        usedCents: usage.extraSpend,
+        limitCents: usage.extraLimit,
+        todayCents: today.todayCents,
+        todayExact: today.todayExact,
+        stale: usage.stale,
+      }));
+      const status = quotaCache.getSnapshot(id)?.status;
+      if (status === "critical") worst = "critical";
+      else if (status === "stressed" && worst === "ok") worst = "stressed";
+    }
+    if (dirty && budgetDayState) saveBudgetDayState(path, budgetDayState);
+    if (parts.length === 0) {
+      ctx.ui.setStatus(BUDGET_STATUS_KEY, undefined);
+      return;
+    }
+    const text = parts.join("  ");
+    const color = worst === "critical" ? "error" : worst === "stressed" ? "warning" : "dim";
+    const themed = ctx.ui.theme?.fg ? ctx.ui.theme.fg(color, text) : text;
+    ctx.ui.setStatus(BUDGET_STATUS_KEY, themed);
+  } catch {
+    // Display only; never let it affect routing.
+  }
+}
+
+/** After a turn, pull a fresh reading if the cache is stale, then repaint. */
+function refreshBudgetAfterTurn(): void {
+  const pending = quotaCache.refreshIfStale();
+  if (pending) pending.then(() => refreshStatus(), () => {});
 }
 
 function routeSummary(routeId: string): string {
@@ -2159,7 +2232,10 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("model_select", async (_event, ctx) => updateUi(ctx));
   pi.on("agent_start", async (_event, ctx) => updateUi(ctx));
-  pi.on("agent_end", async (_event, ctx) => updateUi(ctx));
+  pi.on("agent_end", async (_event, ctx) => {
+    updateUi(ctx);
+    refreshBudgetAfterTurn();
+  });
 
   // Correct tool-name hallucinations: the model often invents MCP-style names
   // (e.g. mcp__tavily__tavily_search) for tools that are actually registered

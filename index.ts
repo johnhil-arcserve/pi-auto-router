@@ -2510,13 +2510,14 @@ export default function (pi: ExtensionAPI) {
         const perToken = getPerTokenProviders();
         const perTokenCount = perToken.length;
         const monthlyLimits = budgetTracker.getMonthlyLimits();
+        const dailyLimits = budgetTracker.getDailyLimits();
         const statusLabel = subscriptionEnabled
           ? (perTokenCount > 0 ? "enabled (+ per-token)" : "enabled")
           : (perTokenCount > 0 ? "enabled (per-token only)" : "disabled");
         const header = `UVI (${statusLabel}):`;
         const missingBudgetLines = perToken
-          .filter(({ provider }) => !(monthlyLimits[provider] > 0))
-          .map(({ provider }) => `  ${provider.padEnd(22)} [set monthly budget: /auto-router budget set ${provider} <usd> monthly]`);
+          .filter(({ provider }) => !(monthlyLimits[provider] > 0) && !(dailyLimits[provider] > 0))
+          .map(({ provider }) => `  ${provider.padEnd(22)} [set a budget: /auto-router budget set ${provider} <usd> [monthly]]`);
         // Collect per-token providers with fetch errors for diagnostics
         const balanceIssueLines: string[] = [];
         for (const [provider, err] of Object.entries(balanceFetchErrors)) {
@@ -2532,18 +2533,18 @@ export default function (pi: ExtensionAPI) {
             ? `${hintParts.join("; ")}. Try /auto-router uvi refresh.`
             : "Set AUTO_ROUTER_UVI=1 or run /auto-router uvi enable to start polling.";
           const out = [header, `  ${hint}`];
-          if (missingBudgetLines.length > 0) out.push("", "💡 Per-token providers need a monthly budget for UVI:", ...missingBudgetLines);
+          if (missingBudgetLines.length > 0) out.push("", "💡 Per-token providers need a budget (daily or monthly) for UVI:", ...missingBudgetLines);
           if (balanceIssueLines.length > 0) out.push(...(missingBudgetLines.length > 0 ? [] : [""]), ...balanceIssueLines);
           ctx.ui.notify(out.join("\n"), "info");
           return;
         }
         const out = [header, ...lines];
         if (perTokenCount === 0) {
-          out.push("", "💡 Per-token providers: none configured. Set a monthly budget to enable:");
-          out.push(`     /auto-router budget set <provider> <usd> monthly`);
+          out.push("", "💡 Per-token providers: none configured. Set a budget to enable:");
+          out.push(`     /auto-router budget set <provider> <usd> [monthly]`);
         } else {
           if (missingBudgetLines.length > 0) {
-            out.push("", "💡 Per-token providers need a monthly budget for UVI:", ...missingBudgetLines);
+            out.push("", "💡 Per-token providers need a budget (daily or monthly) for UVI:", ...missingBudgetLines);
           }
           if (balanceIssueLines.length > 0) {
             out.push("", "⚠ per-token providers not showing:", ...balanceIssueLines);
@@ -2605,7 +2606,7 @@ export default function (pi: ExtensionAPI) {
           ...(uviLines.length > 0 ? ["", "Budget UVI:", ...uviLines] : []),
           "",
           "Subcommands: show | fetch (refresh)",
-          "Set monthly budget: /auto-router budget set <provider> <usd> monthly",
+          "Set a budget: /auto-router budget set <provider> <usd> [monthly]",
         ].join("\n"), "info");
         return;
       }

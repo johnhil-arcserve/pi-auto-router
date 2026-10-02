@@ -18,7 +18,7 @@ import { DEFAULT_SHORTCUTS, listShortcuts, parseShortcut } from "./src/shortcut-
 import { inferRequirements, solveConstraints, tierToRequirements, type CapabilityMap, type ConstraintRequirements } from "./src/constraint-solver.ts";
 import { BudgetTracker, cacheHitRate, monthKey, todayKey, totalPromptTokens } from "./src/budget-tracker.ts";
 import { partitionAuditedCandidates } from "./src/candidate-partitioner.ts";
-import { QuotaCache, mapRouteProviderToOAuth } from "./src/quota-cache.ts";
+import { QuotaCache, mapRouteProviderToOAuth, resolveUviThresholds } from "./src/quota-cache.ts";
 import { getProviderHealthCache } from "./src/health-check.ts";
 import { LatencyTracker } from "./src/latency-tracker.ts";
 import { compareTargets } from "./src/target-ranker.ts";
@@ -34,8 +34,8 @@ import { PolicyEngine, buildStrategyRules, mergeHints, type StrategyRule } from 
 import { CircuitBreaker } from "./src/circuit-breaker.ts";
 import { parseModelSpec, describeTarget, formatHintsHuman, formatRemainingMs, getCooldownMs, parseResetAfterMs, normalizeModelToken, formatModelLine, findCaseInsensitiveKey, getPrimaryModelLimits, findModelInRegistry, validateRouteTarget, getTargetKey } from "./src/display.ts";
 import { hasUsableTargetCredentials, readAuthFile, resolveTargetApiKey } from "./src/auth.ts";
-import { fetchAllBalances, buildMonthlyQuotaWindow, supportsProviderBalance } from "./src/balance-fetcher.ts";
-import { aggregateProviderUVI } from "./src/uvi.ts";
+import { fetchAllBalances, supportsProviderBalance } from "./src/balance-fetcher.ts";
+import { buildBudgetUtilization } from "./src/budget-uvi.ts";
 import { DecisionLogger } from "./src/decision-logger.ts";
 import { RouterEventLogger } from "./src/router-event-logger.ts";
 import { sanitizeContext } from "./src/context-sanitizer.ts";
@@ -43,7 +43,7 @@ import { shouldFailOverThoughtSignatureError } from "./src/signature-failover.ts
 import { detectValidationTrace } from "./src/validation-outcome-detector.ts";
 import { buildSweSubtaskHeuristic } from "./src/swe-subtask-heuristics.ts";
 import { applyCopilotEndpoint } from "./src/copilot-endpoint.ts";
-import type { DecisionLogEntry, RoutingDecision, Tier, Message as RoutingMessage, UtilizationSnapshot, BillingModel, BalanceState, BudgetState, QuotaWindow, PolicyRuleConfig, DecisionAttemptLog, DecisionCandidateTrace, DecisionReasoningTrace } from "./src/types.ts";
+import type { DecisionLogEntry, RoutingDecision, Tier, Message as RoutingMessage, UVIThresholds, BillingModel, BalanceState, BudgetState, PolicyRuleConfig, DecisionAttemptLog, DecisionCandidateTrace, DecisionReasoningTrace } from "./src/types.ts";
 
 const PROVIDER_ID = "auto-router";
 const AUTH_PATH = join(homedir(), ".pi", "agent", "auth.json");
@@ -127,36 +127,43 @@ function envShadowEnabled(): boolean {
   return raw === "1" || (raw ?? "").toLowerCase() === "true" || (raw ?? "").toLowerCase() === "on";
 }
 
+/**
+ * Resolved UVI pacing thresholds (env > settings.json > defaults), memoized
+ * for the process lifetime — matching QuotaCache's "takes effect on the next
+ * pi restart" semantics.
+ */
+let uviThresholdsCache: UVIThresholds | null = null;
+
+function getUviThresholds(): UVIThresholds {
+  if (!uviThresholdsCache) uviThresholdsCache = resolveUviThresholds();
+  return uviThresholdsCache;
+}
+
+/**
+ * Build the utilization map that drives UVI bucketing, from two independent
+ * sources merged in buildBudgetUtilization:
+ *
+ *   1. Subscription (OAuth) usage windows from QuotaCache (only when enabled)
+ *   2. User-configured budget windows — daily and/or monthly USD limits from
+ *      the stats file vs tracked spend — computed for every provider with a
+ *      limit, no balance endpoint required
+ *
+ * In-memory only, so it is safe to call from display paths as well as the
+ * routing pipeline. Always replaces the stored map, so cleared budgets stop
+ * pacing on the next sync.
+ */
 function syncUtilizationIntoBudget(): void {
-  const remapped: Record<string, UtilizationSnapshot> = {};
-
-  // Subscription UVI (only when enabled)
-  if (quotaCache.isEnabled()) {
-    const snapshots = quotaCache.getAllSnapshots();
-    for (const [oauthId, snap] of Object.entries(snapshots)) {
-      remapped[oauthId] = snap;
-      // claude-agent-sdk removed — no longer remap anthropic UVI to it
-    }
-  }
-
-  // Per-token provider UVI windows — always computed, independent of subscription UVI toggle
-  const now = Date.now();
-  for (const [provider, balance] of balanceCache) {
-    if (balance.error) continue;
-    const monthlyLimit = budgetTracker.getMonthlyLimits();
-    const limit = monthlyLimit[provider];
-    if (!limit || limit <= 0) continue;
-    const monthlySpend = budgetTracker.getMonthlySpend()[provider] ?? 0;
-    const window = buildMonthlyQuotaWindow(provider, monthlySpend, limit, now);
-    if (window) {
-      const snap = aggregateProviderUVI(provider, [window], now);
-      remapped[provider] = snap;
-    }
-  }
-
-  if (Object.keys(remapped).length > 0) {
-    budgetTracker.setUtilization(remapped);
-  }
+  const oauthSnapshots = quotaCache.isEnabled() ? quotaCache.getAllSnapshots() : {};
+  const utilization = buildBudgetUtilization({
+    oauthSnapshots,
+    dailyLimits: budgetTracker.getDailyLimits(),
+    dailySpend: budgetTracker.getDailySpend(),
+    monthlyLimits: budgetTracker.getMonthlyLimits(),
+    monthlySpend: budgetTracker.getMonthlySpend(),
+    now: Date.now(),
+    thresholds: getUviThresholds(),
+  });
+  budgetTracker.setUtilization(utilization);
 }
 
 function getPerTokenProviders(): Array<{ provider: string; authProvider?: string; balanceEndpoint?: string }> {
@@ -259,24 +266,14 @@ function triggerStartupUviRefresh(): void {
   });
 }
 
-function formatUtilizationLines(cache: QuotaCache): string[] {
-  const snapshots = cache.getAllSnapshots();
-  // Merge in per-token UVI from monthly budget/spend. Balance fetch is optional:
-  // some providers (e.g. Google/Gemini API key) do not expose a supported balance
-  // endpoint/parser, but we can still compute UVI from tracked spend vs budget.
-  const now = Date.now();
-  const monthlyLimit = budgetTracker.getMonthlyLimits();
-  const monthlySpend = budgetTracker.getMonthlySpend();
-  for (const [provider, limit] of Object.entries(monthlyLimit)) {
-    if (!limit || limit <= 0) continue;
-    const spend = monthlySpend[provider] ?? 0;
-    const window = buildMonthlyQuotaWindow(provider, spend, limit, now);
-    if (window) {
-      const snap = aggregateProviderUVI(provider, [window], now);
-      snapshots[provider] = snap;
-    }
-  }
-  const entries = Object.entries(snapshots);
+/**
+ * Human-readable UVI lines for the merged utilization map (OAuth + budget
+ * windows). The sync it triggers is in-memory, so command output reflects
+ * current spend even when no prompt has gone through the routing pipeline.
+ */
+function formatUtilizationLines(): string[] {
+  syncUtilizationIntoBudget();
+  const entries = Object.entries(budgetTracker.getUtilization());
   if (entries.length === 0) return [];
   return entries.map(([provider, snap]) => {
     const winSummary = snap.windows.length > 0
@@ -2024,29 +2021,11 @@ function getCompactStatusLine(routeId?: string): string {
 }
 
 function formatUviStatusSegment(): string {
-  const snaps: Record<string, UtilizationSnapshot> = {};
-
-  // Subscription UVI (only when enabled)
-  if (quotaCache.isEnabled()) {
-    Object.assign(snaps, quotaCache.getAllSnapshots());
-  }
-
-  // Per-token UVI from monthly spend vs budget
-  const now = Date.now();
-  const monthlyLimit = budgetTracker.getMonthlyLimits();
-  const monthlySpend = budgetTracker.getMonthlySpend();
-  for (const [provider, balance] of balanceCache) {
-    if (balance.error) continue;
-    const limit = monthlyLimit[provider];
-    if (!limit || limit <= 0) continue;
-    const spend = monthlySpend[provider] ?? 0;
-    const window = buildMonthlyQuotaWindow(provider, spend, limit, now);
-    if (window) {
-      snaps[provider] = aggregateProviderUVI(provider, [window], now);
-    }
-  }
-
-  const hot = Object.values(snaps).filter((s) => s.status === "stressed" || s.status === "critical");
+  // Merged OAuth + budget utilization, kept fresh by the routing pipeline's
+  // sync on every prompt; reading the stored map keeps footer rendering free
+  // of recomputation.
+  const hot = Object.values(budgetTracker.getUtilization())
+    .filter((s) => s.status === "stressed" || s.status === "critical");
   if (hot.length === 0) return "";
   const parts = hot.map((s) => `${s.provider}=${s.uvi.toFixed(2)} ${s.status}`);
   return ` | uvi: ${parts.join(", ")}`;
@@ -2521,12 +2500,12 @@ export default function (pi: ExtensionAPI) {
           if (subscriptionEnabled) await quotaCache.refreshNow();
           if (perTokenCount > 0) { balanceLastRefreshAt = 0; await refreshBalances(); }
           syncUtilizationIntoBudget();
-          const lines = formatUtilizationLines(quotaCache);
+          const lines = formatUtilizationLines();
           ctx.ui.notify(lines.length > 0 ? ["UVI snapshot:", ...lines].join("\n") : "UVI: no snapshots (no providers with quota/balance data)", "info");
           return;
         }
         // show (default)
-        const lines = formatUtilizationLines(quotaCache);
+        const lines = formatUtilizationLines();
         const subscriptionEnabled = quotaCache.isEnabled();
         const perToken = getPerTokenProviders();
         const perTokenCount = perToken.length;
@@ -2610,23 +2589,20 @@ export default function (pi: ExtensionAPI) {
           }
         }
         const uviLines = (() => {
+          syncUtilizationIntoBudget();
           const lines: string[] = [];
-          for (const [provider, balance] of balanceCache) {
-            if (balance.error) continue;
-            const limit = budgetTracker.getMonthlyLimits()[provider];
-            if (!limit) continue;
-            const spend = budgetTracker.getMonthlySpend()[provider] ?? 0;
-            const window = buildMonthlyQuotaWindow(provider, spend, limit);
-            if (!window) continue;
-            const snap = aggregateProviderUVI(provider, [window], Date.now());
-            lines.push(`  ${provider.padEnd(22)} UVI=${snap.uvi.toFixed(2).padStart(5)} ${snap.status.padEnd(8)} | monthly@${Math.round((budgetTracker.getMonthlySpend()[provider] ?? 0) / (budgetTracker.getMonthlyLimits()[provider] ?? 1) * 100)}%`);
+          for (const snap of Object.values(budgetTracker.getUtilization())) {
+            const budgetWindows = snap.windows.filter((w) => w.source === "config");
+            if (budgetWindows.length === 0) continue;
+            const summary = budgetWindows.map((w) => `${w.scope}@${Math.round(w.usedPercent)}%`).join(", ");
+            lines.push(`  ${snap.provider.padEnd(22)} UVI=${snap.uvi.toFixed(2).padStart(5)} ${snap.status.padEnd(8)} | ${summary}`);
           }
           return lines;
         })();
         ctx.ui.notify([
           "Per-token provider balances:",
           ...lines,
-          ...(uviLines.length > 0 ? ["", "Monthly UVI:", ...uviLines] : []),
+          ...(uviLines.length > 0 ? ["", "Budget UVI:", ...uviLines] : []),
           "",
           "Subcommands: show | fetch (refresh)",
           "Set monthly budget: /auto-router budget set <provider> <usd> monthly",
@@ -2670,7 +2646,7 @@ export default function (pi: ExtensionAPI) {
             ctx.ui.notify(`No budget activity yet for ${day} (daily) / ${mon} (monthly). Set a limit with: /auto-router budget set <provider> <usd> [monthly]`, "info");
             return;
           }
-          const uviLines = formatUtilizationLines(quotaCache);
+          const uviLines = formatUtilizationLines();
           const out = [`Auto-router budget for ${day} (daily) / ${mon} (monthly):`, ...lines];
           if (uviLines.length > 0) {
             out.push("", "UVI (utilization velocity):", ...uviLines);

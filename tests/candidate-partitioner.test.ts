@@ -75,6 +75,22 @@ describe("partitionAuditedCandidates", () => {
     assert.match(result.warnings[0], /near its daily budget/);
   });
 
+  it("dedupes warnings per provider across multiple targets (footer repeat bug)", () => {
+    // A route can carry several tiers on the same stressed provider (e.g.
+    // Sonnet/Haiku/Opus all on "anthropic"). Each target audits identically,
+    // so without dedup the same warning string is pushed once per target.
+    const a = target("anthropic", "Sonnet");
+    const b = target("anthropic", "Haiku");
+    const c = target("anthropic", "Opus");
+    const budgetState: BudgetState = {
+      dailySpend: { anthropic: 8 },
+      dailyLimit: { anthropic: 10 },
+    };
+    const result = partitionAuditedCandidates([a, b, c], budgetState);
+    assert.equal(result.warnings.length, 1);
+    assert.match(result.warnings[0], /near its daily budget/);
+  });
+
   it("treats UVI critical as blocked", () => {
     const a = target("openai-codex", "A");
     const b = target("claude-agent-sdk", "B");

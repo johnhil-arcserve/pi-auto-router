@@ -23,6 +23,7 @@ export function partitionAuditedCandidates(
   const demoted: RouteTarget[] = [];
   const rejections: string[] = [];
   const warnings: string[] = [];
+  const warnedProviders = new Set<string>();
   const uviNotes: string[] = [];
   const audits = new Map<RouteTarget, BudgetAuditResult>();
 
@@ -33,8 +34,13 @@ export function partitionAuditedCandidates(
       rejections.push(`${cand.label}: ${audit.message}`);
       continue;
     }
-    if (audit.status === "warning" && audit.message) {
+    // Budgets and UVI are audited per provider, so every target sharing a
+    // stressed provider (e.g. Sonnet/Haiku/Opus all on `anthropic`) produces
+    // the identical warning. Only surface it once per provider, otherwise it
+    // gets joined N times into the same footer/reasoning string.
+    if (audit.status === "warning" && audit.message && !warnedProviders.has(cand.provider)) {
       warnings.push(audit.message);
+      warnedProviders.add(cand.provider);
     }
     if (audit.hint === "promote") {
       promoted.push(cand);

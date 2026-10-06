@@ -2012,12 +2012,31 @@ function getCompactStatusLine(routeId?: string): string {
   if (healthyTargets.length === 0) parts.push("⚠ no healthy targets");
   else if (out.length > 0) parts.push(`⚠ out: ${out.join(", ")}`);
   const budgetWarning = lastBudgetWarningByRoute.get(routeId);
-  if (budgetWarning) parts.push(`⚠ ${budgetWarning}`);
+  if (budgetWarning) parts.push(`⚠ ${shortenBudgetWarning(budgetWarning)}`);
   // These helpers already return "" when healthy and lead with " | ".
   const alerts = `${formatHealthIssuesSegment(healthyTargets)}${formatCircuitStatusSegment()}${formatUviStatusSegment()}`
     .split(" | ").map((s) => s.trim()).filter(Boolean);
   parts.push(...alerts);
   return parts.join(" · ");
+}
+
+/**
+ * Budget/UVI warning messages (budget-auditor.ts) carry a full diagnostic
+ * breakdown meant for /auto-router status, the decision log, and reasoning
+ * text (e.g. "anthropic UVI stressed (1.10); stressed (worst: daily@67%;
+ * all: session@0%, ...)"). The compact footer only needs the headline
+ * clause; formatUviStatusSegment() already supplies the short uvi=status
+ * form alongside it. Multiple providers' warnings are joined with " | " by
+ * the caller, so split/shorten/rejoin rather than assuming a single message.
+ */
+function shortenBudgetWarning(message: string): string {
+  return message
+    .split(" | ")
+    .map((part) => {
+      const i = part.indexOf("; ");
+      return i === -1 ? part : part.slice(0, i);
+    })
+    .join(" | ");
 }
 
 function formatUviStatusSegment(): string {

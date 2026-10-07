@@ -2011,12 +2011,16 @@ function getCompactStatusLine(routeId?: string): string {
   if (uviHardMode && quotaCache.isEnabled()) parts.push("🛡️ uvi-hard");
   if (healthyTargets.length === 0) parts.push("⚠ no healthy targets");
   else if (out.length > 0) parts.push(`⚠ out: ${out.join(", ")}`);
-  const budgetWarning = lastBudgetWarningByRoute.get(routeId);
-  if (budgetWarning) parts.push(`⚠ ${shortenBudgetWarning(budgetWarning)}`);
   // These helpers already return "" when healthy and lead with " | ".
   const alerts = `${formatHealthIssuesSegment(healthyTargets)}${formatCircuitStatusSegment()}${formatUviStatusSegment()}`
     .split(" | ").map((s) => s.trim()).filter(Boolean);
   parts.push(...alerts);
+  // Fall back to the raw budget-auditor reason only when it's NOT a UVI
+  // demotion (formatUviStatusSegment already covers that case tersely) —
+  // e.g. a hard spend-cap hit, which carries no uvi=status entry.
+  const budgetWarning = lastBudgetWarningByRoute.get(routeId);
+  const uviCovered = alerts.some((a) => a.startsWith("uvi:"));
+  if (budgetWarning && !uviCovered) parts.push(`⚠ ${shortenBudgetWarning(budgetWarning)}`);
   return parts.join(" · ");
 }
 
